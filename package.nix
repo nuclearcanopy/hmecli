@@ -35,7 +35,7 @@ python3Packages.buildPythonApplication {
   meta = {
     description = "Generate iCloud Hide My Email aliases from the command line";
     homepage = "https://github.com/nuclearcanopy/hmecli";
-    license = lib.licenses.mit;
+    license = lib.licenses.agpl3Plus;
     mainProgram = "hmecli";
     platforms = lib.platforms.linux;
   };

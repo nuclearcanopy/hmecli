@@ -45,4 +45,6 @@ Apple rate-limits generation (~5/hour is common); `--delay` spaces requests.
     python -m unittest
     nix flake check
 
-Research on similar projects: `hme-research.md`. License: MIT.
+Research on similar projects: `hme-research.md`.
+
+Licensed under AGPL-3.0-or-later; see `LICENSE`.

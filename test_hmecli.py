@@ -60,6 +60,52 @@ class T(unittest.TestCase):
         self.assertEqual(g.get_header("Cookie"), "X-APPLE-WEBAUTH-USER=1")
         self.assertEqual(g.get_header("Origin"), "https://www.icloud.com")
 
+    def gen(self, args, tty, answer="", **kw):
+        f = Fake([ok({"hme": "a@icloud.com"}), ok({"hme": {"hme": "a@icloud.com"}})] * 3)
+        asked = []
+        rc, out, err = self.run_cmd(h.cmd_generate, ["generate", "--delay", "0"] + args,
+                                    opener=f, sleep=lambda s: None, isatty=lambda: tty,
+                                    ask=lambda p: asked.append(p) or answer)
+        bodies = [json.loads(r.data) for r in f.reqs if r.full_url.split("?")[0].endswith("reserve")]
+        return rc, asked, err, bodies
+
+    def test_label_prompt_answer_used(self):
+        rc, asked, err, b = self.gen([], True, "shop")
+        self.assertEqual((rc, len(asked)), (0, 1))
+        self.assertIn("Label (Enter for none): ", err)
+        self.assertEqual(b[0]["label"], "shop")
+
+    def test_label_prompt_empty_means_none(self):
+        _, asked, _, b = self.gen([], True, "")
+        self.assertEqual(len(asked), 1)
+        self.assertNotIn("label", b[0])
+
+    def test_no_prompt_without_tty(self):
+        _, asked, err, b = self.gen([], False, "x")
+        self.assertEqual(asked, [])
+        self.assertNotIn("Label", err)
+        self.assertNotIn("label", b[0])
+
+    def test_no_prompt_with_json(self):
+        _, asked, _, b = self.gen(["--json"], True, "x")
+        self.assertEqual(asked, [])
+        self.assertNotIn("label", b[0])
+
+    def test_label_flag_no_prompt(self):
+        _, asked, _, b = self.gen(["--label", "L"], True, "x")
+        self.assertEqual(asked, [])
+        self.assertEqual(b[0]["label"], "L")
+
+    def test_empty_label_flag_means_none(self):
+        _, asked, _, b = self.gen(["--label", ""], True, "x")
+        self.assertEqual(asked, [])
+        self.assertNotIn("label", b[0])
+
+    def test_prompt_once_for_three(self):
+        _, asked, _, b = self.gen(["-n", "3"], True, "shop")
+        self.assertEqual(len(asked), 1)
+        self.assertEqual([x["label"] for x in b], ["shop"] * 3)
+
     def test_generate_json(self):
         f = Fake([ok({"hme": "a@icloud.com"}), ok({"hme": {"hme": "a@icloud.com"}})])
         rc, out, _ = self.run_cmd(h.cmd_generate, ["generate", "--json"], opener=f)
@@ -93,6 +139,76 @@ class T(unittest.TestCase):
                                     {"hme": "b@x", "isActive": False}]})])
         rc, out, _ = self.run_cmd(h.cmd_list, ["list"], opener=f)
         self.assertEqual(out, "a@x\tactive\tl\n")
+
+    A = {"hme": "a@icloud.com", "anonymousId": "ANON-A", "isActive": True}
+    B = {"hme": "b@icloud.com", "anonymousId": "ANON-B", "isActive": False}
+
+    def lst(self): return ok({"hmeEmails": [self.A, self.B]})
+
+    def test_deactivate(self):
+        f = Fake([self.lst(), ok({})])
+        rc, out, _ = self.run_cmd(h.cmd_deactivate, ["deactivate", "A@iCloud.com"], opener=f)
+        self.assertEqual((rc, out), (0, "deactivated a@icloud.com\n"))
+        r = f.reqs[1]
+        self.assertEqual((r.get_method(), json.loads(r.data)), ("POST", {"anonymousId": "ANON-A"}))
+        self.assertTrue(r.full_url.startswith(
+            "https://p99-maildomainws.icloud.com/v1/hme/deactivate?"))
+
+    def test_delete_inactive_confirmed(self):
+        f = Fake([self.lst(), ok({})])
+        rc, out, _ = self.run_cmd(h.cmd_delete, ["delete", "b@icloud.com"], opener=f,
+                                  confirm=lambda p: "y", isatty=lambda: True)
+        self.assertEqual((rc, out), (0, "deleted b@icloud.com\n"))
+        self.assertEqual(len(f.reqs), 2)
+        r = f.reqs[1]
+        self.assertTrue(r.full_url.startswith(
+            "https://p99-maildomainws.icloud.com/v1/hme/delete?"))
+        self.assertEqual(json.loads(r.data), {"anonymousId": "ANON-B"})
+
+    def test_delete_active_deactivates_first(self):
+        f = Fake([self.lst(), ok({}), ok({})])
+        prompts = []
+        rc, out, _ = self.run_cmd(h.cmd_delete, ["delete", "a@icloud.com"], opener=f,
+                                  confirm=lambda p: prompts.append(p) or "yes",
+                                  isatty=lambda: True)
+        self.assertEqual(rc, 0)
+        self.assertEqual([r.full_url.split("?")[0].rsplit("/", 1)[1] for r in f.reqs[1:]],
+                         ["deactivate", "delete"])
+        self.assertIn("permanent", prompts[0].lower())
+        self.assertIn("deactivate", prompts[0].lower())
+
+    def test_delete_declined_makes_no_call(self):
+        f = Fake([self.lst()])
+        rc, out, _ = self.run_cmd(h.cmd_delete, ["delete", "a@icloud.com"], opener=f,
+                                  confirm=lambda p: "n", isatty=lambda: True)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(len(f.reqs), 1)  # only the list lookup
+
+    def test_delete_non_tty_without_yes_refuses(self):
+        f = Fake([self.lst()])
+        rc, _, err = self.run_cmd(h.cmd_delete, ["delete", "a@icloud.com"], opener=f,
+                                  isatty=lambda: False)
+        self.assertEqual(rc, 1)
+        self.assertIn("--yes", err)
+        self.assertEqual(len(f.reqs), 1)
+
+    def test_delete_yes_skips_prompt(self):
+        f = Fake([self.lst(), ok({})])
+        rc, _, _ = self.run_cmd(h.cmd_delete, ["delete", "--yes", "b@icloud.com"], opener=f,
+                                isatty=lambda: False)
+        self.assertEqual((rc, len(f.reqs)), (0, 2))
+
+    def test_alias_not_found_and_bare_id(self):
+        for cmd, fn in (("delete", h.cmd_delete), ("deactivate", h.cmd_deactivate)):
+            f = Fake([self.lst()])
+            rc, _, err = self.run_cmd(fn, [cmd, "--yes", "zz@icloud.com"] if cmd == "delete"
+                                      else [cmd, "zz@icloud.com"], opener=f)
+            self.assertEqual(rc, 1)
+            self.assertIn("not found", err)
+            self.assertEqual(len(f.reqs), 1)
+        f = Fake([])
+        rc, _, err = self.run_cmd(h.cmd_deactivate, ["deactivate", "ANON-A"], opener=f)
+        self.assertEqual((rc, len(f.reqs)), (1, 0))
 
     def test_status(self):
         rc, out, _ = self.run_cmd(h.cmd_status, ["status"], opener=Fake([VALID]))

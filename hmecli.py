@@ -3,7 +3,7 @@
 
 login   reads your icloud.com session from your browser's cookie store
         (you sign in, including 2FA, in the browser; no password is ever typed here)
-generate / list / status / logout
+generate / list / deactivate / delete / status / logout
 """
 import argparse
 import json
@@ -144,12 +144,23 @@ class Client:
         return res["hme"]
 
     def reserve(self, hme, label, note):
-        res = self.check(self.call("POST", self.url("v1", "reserve"),
-                                   {"hme": hme, "label": label, "note": note}), "reserve")
+        body = {"hme": hme, "note": note}
+        if label:  # no label: omit the key rather than send an empty string
+            body["label"] = label
+        res = self.check(self.call("POST", self.url("v1", "reserve"), body), "reserve")
         return res["hme"]["hme"]
 
     def list(self):
         return self.check(self.call("GET", self.url("v2", "list")), "list")
+
+
+    def deactivate(self, anonymous_id):
+        self.check(self.call("POST", self.url("v1", "deactivate"),
+                             {"anonymousId": anonymous_id}), "deactivate")
+
+    def delete(self, anonymous_id):
+        self.check(self.call("POST", self.url("v1", "delete"),
+                             {"anonymousId": anonymous_id}), "delete")
 
 
 # ---------------------------------------------------------------- browser cookies
@@ -226,9 +237,15 @@ def cmd_status(a, env=None, opener=None):
     return EXIT_OK
 
 
-def cmd_generate(a, env=None, opener=None, sleep=time.sleep):
+def cmd_generate(a, env=None, opener=None, sleep=time.sleep, ask=input, isatty=None):
     if a.count < 1:
         raise HmeError("--count must be >= 1")
+    label = a.label
+    if label is None:
+        interactive = isatty() if isatty else sys.stdin.isatty()
+        if interactive and not a.json:
+            print("Label (Enter for none): ", end="", file=sys.stderr, flush=True)
+            label = ask("").strip()
     c = client_from_session(load_session(session_path(env)), opener)
     out, err = [], None
     show = sys.stderr.isatty() and not a.json
@@ -238,7 +255,7 @@ def cmd_generate(a, env=None, opener=None, sleep=time.sleep):
         try:
             if show:
                 print(f"\r[{i + 1}/{a.count}]", end="", file=sys.stderr, flush=True)
-            addr = c.reserve(c.generate(), a.label, a.note)
+            addr = c.reserve(c.generate(), label, a.note)
         except HmeError as e:
             err = e
             break
@@ -271,6 +288,47 @@ def cmd_list(a, env=None, opener=None):
     return EXIT_OK
 
 
+def find_alias(client, alias):
+    """Look up an alias by its hme email (case-insensitive) in the list response."""
+    if "@" not in alias:
+        raise HmeError(f"{alias!r} is not an alias address; pass the hme email "
+                       f"(see: {APP} list --all)")
+    for e in client.list().get("hmeEmails", []):
+        if e.get("hme", "").lower() == alias.lower():
+            if not e.get("anonymousId"):
+                raise HmeError(f"no anonymousId in list response for {e['hme']}")
+            return e
+    raise HmeError(f"alias not found: {alias}")
+
+
+def cmd_deactivate(a, env=None, opener=None):
+    c = client_from_session(load_session(session_path(env)), opener)
+    e = find_alias(c, a.alias)
+    c.deactivate(e["anonymousId"])
+    print(f"deactivated {e['hme']}")
+    return EXIT_OK
+
+
+def cmd_delete(a, env=None, opener=None, confirm=input, isatty=None):
+    c = client_from_session(load_session(session_path(env)), opener)
+    e = find_alias(c, a.alias)
+    if not a.yes:
+        if not (isatty() if isatty else sys.stdin.isatty()):
+            raise HmeError("refusing to delete without confirmation in a "
+                           "non-interactive run; pass --yes")
+        first = "Deactivate and then permanently delete" if e.get("isActive") \
+            else "Permanently delete"
+        ans = confirm(f"{first} {e['hme']}? This cannot be undone. [y/N] ")
+        if ans.strip().lower() not in ("y", "yes"):
+            print("aborted", file=sys.stderr)
+            return EXIT_ERROR
+    if e.get("isActive"):
+        c.deactivate(e["anonymousId"])
+    c.delete(e["anonymousId"])
+    print(f"deleted {e['hme']}")
+    return EXIT_OK
+
+
 def cmd_logout(a, env=None):
     path = session_path(env)
     try:
@@ -296,7 +354,9 @@ def build_parser():
 
     s = sub.add_parser("generate", help="generate and reserve aliases")
     s.add_argument("-n", "--count", type=int, default=1)
-    s.add_argument("-l", "--label", default="hmecli")
+    s.add_argument("-l", "--label", default=None,
+                   help="label for the aliases; '' for none. default: ask on a "
+                        "terminal, otherwise no label")
     s.add_argument("--note", default="Generated with hmecli")
     s.add_argument("--json", action="store_true", help="print a JSON array")
     s.add_argument("--delay", type=float, default=2.0, help="seconds between aliases")
@@ -306,6 +366,15 @@ def build_parser():
     s.add_argument("--all", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("deactivate", help="deactivate an alias (stops forwarding)")
+    s.add_argument("alias", help="the alias address (hme email)")
+    s.set_defaults(fn=cmd_deactivate)
+
+    s = sub.add_parser("delete", help="PERMANENTLY delete an alias (deactivates first if active)")
+    s.add_argument("alias", help="the alias address (hme email)")
+    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    s.set_defaults(fn=cmd_delete)
 
     s = sub.add_parser("status", help="check that the stored session still works")
     s.set_defaults(fn=cmd_status)
